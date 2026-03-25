@@ -173,12 +173,16 @@ Main files:
 2. Start Postgres
    - `docker compose up -d`
 3. Configure environment
-   - copy `.env.example` to `.env` (then adjust `DATABASE_URL` if needed)
+   - copy content of `.env.example` to `.env` (then adjust `DATABASE_URL` if needed)
+   * We are currently using 'postgresql://app:app@localhost'
 4. Migrate + seed
    - `npm run migrate`
    - `npm run seed`
 5. Run API
    - `npm run dev`
+6. Test by either using browser or Postman:
+   - First Request: http://localhost:3000/v2/feed?user_id=1&limit=10
+   - Second Request (after getting the cursor from server): http://localhost:3000/v2/feed?user_id=1&limit=10&cursor=eyJ0cyI6IjIwMjYtMDMtMjVUMDk6MjQ6MzYuMDk1WiIsImlkIjoiMTkxIn0
 
 Example:
 
