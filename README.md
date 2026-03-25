@@ -2,13 +2,13 @@
 
 This project implements a feed API for a large `posts` table (PostgreSQL) using cursor-based pagination instead of `OFFSET/LIMIT`.
 
-## Part I - Why OFFSET degrades (PostgreSQL mechanics)
+## PART 1 - Why OFFSET degrades (PostgreSQL mechanics)
 
 With PostgreSQL, `OFFSET N LIMIT 20` does not “jump” to row `N`. It effectively:
 
-1. scans/materializes the first `N` rows,
-2. discards them,
-3. then returns the next `20` rows.
+1. Scans/materializes the first `N` rows,
+2. Discards them,
+3. Then returns the next `20` rows.
 
 Even with a supporting index, those skipped rows still cost work (index lookups, possible heap fetches, buffer loads, etc.). As `N` grows, each page becomes slower than the last, producing the classic `O(offset)` degradation curve.
 
@@ -19,12 +19,12 @@ In addition to performance, `OFFSET` is position-based:
 
 This project fixes both by using cursor/keyset pagination based on a deterministic logical coordinate (`created_at` + `id`).
 
-## Cursor design
+## PART 2 - Cursor design
 
 Cursor is an opaque string:
 
-- base64url-encoded JSON payload
-- clients must treat the cursor as a black box (store and pass it back)
+- Base64url-encoded JSON payload
+- Clients must treat the cursor as a black box (store and pass it back)
 
 Payload shape:
 
@@ -47,7 +47,7 @@ And use deterministic tuple predicates:
 
 To support “before” efficiently, we query `ORDER BY created_at ASC, id ASC` with a limit, then reverse the returned rows before sending them to the client.
 
-## Design Architecture & Flows
+## PART 3 - Design Architecture & Flows
 
 ### High-level request flow
 
@@ -107,7 +107,7 @@ flowchart LR
   CUR -.-> backdated
 ```
 
-## API
+## PART 4 - API
 
 ### `GET /v2/feed` (cursor pagination)
 
@@ -167,15 +167,15 @@ Behavior:
 
 - `page >= 50` returns `400` with an error message directing clients to `/v2/feed`.
 - For `page < 50`, the adapter converts the page number into a cursor by:
-  1. using small `OFFSET` to find the “anchor” row for the previous boundary,
-  2. encoding that anchor as a cursor,
-  3. executing the cursor engine (keyset pagination).
+  1. Using small `OFFSET` to find the “anchor” row for the previous boundary,
+  2. Encoding that anchor as a cursor,
+  3. Executing the cursor engine (keyset pagination).
 
 Note on page indexing:
 
 - This adapter assumes `page=0` means the first page (OFFSET=0). If your existing mobile app is 1-based, change the adapter mapping accordingly.
 
-## Migration Plan (v1 `?page=N` -> v2 cursors)
+## PART 5 - Migration Plan (v1 `?page=N` -> v2 cursors)
 
 Goal: keep old clients working during rollout, without reintroducing the deep-OFFSET performance bug.
 
@@ -192,7 +192,7 @@ Why the `page >= 50` guard?
 - Perfect backward compatibility for very deep pages would require using deep OFFSET to “recreate” a cursor boundary.
 - The assignment explicitly prioritizes fixing the performance/mechanics issue, so deep `OFFSET` is intentionally blocked.
 
-## PostgreSQL schema
+## PART 6 - PostgreSQL schema
 
 Run migrations:
 
@@ -202,7 +202,7 @@ Run migrations:
 
 The composite index is the key to making the tuple predicates and the cursor order fast.
 
-## Focus Questions (required by PRD)
+## PART 7 - Focus Questions 
 
 ### Q1: What does the cursor encode and why is that right given backdated inserts?
 
@@ -216,8 +216,8 @@ The cursor encodes a logical coordinate (timestamp + id), not a physical row off
 
 If the row corresponding to the cursor is deleted, the WHERE predicate still defines a consistent logical boundary:
 
-- the deleted row simply isn’t returned
-- pagination continues without producing an error or a broken “cursor chain”
+- The deleted row simply isn’t returned
+- Pagination continues without producing an error or a broken “cursor chain”
 
 ### Q3: What consistency guarantees does your pagination provide?
 
@@ -238,10 +238,10 @@ Not guaranteed (by design / trade-off):
 
 Approach:
 
-- return `has_next_page` / `has_previous_page` booleans only
-- if UI needs an approximate total, maintain a counter table updated asynchronously (triggers or a background job), never counting per-request.
+- Return `has_next_page` / `has_previous_page` booleans only
+- If UI needs an approximate total, maintain a counter table updated asynchronously (triggers or a background job), never counting per-request.
 
-## Implementation notes
+## PART 8 - Implementation notes
 
 Main files:
 
@@ -256,7 +256,7 @@ Main files:
 2. Start Postgres
    - `docker compose up -d`
 3. Configure environment
-   - copy content of `.env.example` to `.env` (then adjust `DATABASE_URL` if needed)
+   - Copy content of `.env.example` to `.env` (then adjust `DATABASE_URL` if needed)
    * We are currently using 'postgresql://app:app@localhost'
 4. Migrate + seed
    - `npm run migrate`
@@ -268,15 +268,15 @@ Main files:
    - Second Request (scroll older): http://localhost:3000/v2/feed?user_id=1&limit=10&after=`end_cursor`
    - Second Request (scroll newer): http://localhost:3000/v2/feed?user_id=1&limit=10&before=`start_cursor`
 
-## Tests
+## PART 9 - Tests
 
-Integration tests are included (Jest) and exercise:
+Integration tests are included (Jest) and exercise. Please refer to the `feed.pagination.test.js` file for a more indepth information of each test case:
 
-- empty feed
-- single page
-- deleted post cursor does not break pagination
-- identical `created_at` timestamps paginate correctly via the `id` tie-breaker
-- backdated inserts appear on the next page boundary (no skip)
+- Empty feed
+- Single page
+- Deleted post cursor does not break pagination
+- Identical `created_at` timestamps paginate correctly via the `id` tie-breaker
+- Backdated inserts appear on the next page boundary (no skip)
 
 Run:
 1. For Mac/Linux:
