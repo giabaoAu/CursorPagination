@@ -2,7 +2,7 @@
 
 This project implements a feed API for a large `posts` table (PostgreSQL) using cursor-based pagination instead of `OFFSET/LIMIT`.
 
-## Why OFFSET degrades (PostgreSQL mechanics)
+## Part I - Why OFFSET degrades (PostgreSQL mechanics)
 
 With PostgreSQL, `OFFSET N LIMIT 20` does not “jump” to row `N`. It effectively:
 
@@ -47,6 +47,65 @@ And use deterministic tuple predicates:
 
 To support “before” efficiently, we query `ORDER BY created_at ASC, id ASC` with a limit, then reverse the returned rows before sending them to the client.
 
+## Design Architecture & Flows
+
+### High-level request flow
+
+```mermaid
+flowchart LR
+  C[Client] -->|GET /v2/feed| API[Express route]
+  API --> VAL[Validate query params (zod)]
+  VAL -->|after/before present?| BR{Cursor mode?}
+  BR -->|after| DECA[Decode cursor (base64url JSON)]
+  BR -->|before| DECB[Decode cursor (base64url JSON)]
+  BR -->|none| Q0[First load query: newest-first]
+  DECA --> QD[Query older posts\nWHERE (created_at,id) < (ts,id)\nORDER BY created_at DESC, id DESC\nLIMIT (limit+1)]
+  DECB --> QN[Query newer posts\nWHERE (created_at,id) > (ts,id)\nORDER BY created_at ASC, id ASC\nLIMIT (limit+1)\n(reverse rows for response)]
+  Q0 --> ENC[Encode start/end cursors]
+  QD --> ENC
+  QN --> ENC
+  ENC --> RESP[Return posts + page_info\nhas_next_page / has_previous_page]
+```
+
+### Pagination decision logic
+
+```mermaid
+flowchart TD
+  A[Request to /v2/feed] --> B{after provided?}
+  B -->|yes| C[Scroll DOWN: older posts]
+  B -->|no| D{before provided?}
+  D -->|yes| E[Scroll UP: newer posts]
+  D -->|no| F[First load: newest posts]
+
+  C --> G[Predicate: (created_at,id) < (cursor_ts,cursor_id)]
+  E --> H[Predicate: (created_at,id) > (cursor_ts,cursor_id)]
+  F --> I[No predicate]
+
+  G --> J[ORDER BY created_at DESC, id DESC]
+  H --> K[ORDER BY created_at ASC, id ASC then reverse result]
+  I --> L[ORDER BY created_at DESC, id DESC]
+```
+
+### Cursor tuple semantics (backdated insert + deletion)
+
+```mermaid
+flowchart LR
+  subgraph LogicalOrder[Logical feed order (newest -> oldest)]
+    X1[(created_at,id)=P0] --> X2[(created_at,id)=P1] --> X3[(created_at,id)=P2]
+  end
+
+  CUR[Cursor points to (ts,id) = P1] --> OLDP[after => fetch "older": tuples < P1]
+  CUR --> NEWP[before => fetch "newer": tuples > P1]
+
+  del[If P1 is deleted]:::warn --> still[Boundary remains valid:\nquery still runs,\nP1 just isn't returned]
+  backdated[If a backdated post inserts\nbetween already-fetched pages]:::info --> next[Next page includes it\n(no skip at boundary)]
+
+  classDef warn fill:#fff0f0,stroke:#cc0000;
+  classDef info fill:#f0f7ff,stroke:#0066cc;
+  CUR -.-> del
+  CUR -.-> backdated
+```
+
 ## API
 
 ### `GET /v2/feed` (cursor pagination)
@@ -89,6 +148,12 @@ Empty feed:
 - cursors are `null`
 - both `has_next_page` and `has_previous_page` are `false`
 
+Edge cases handled:
+- Deleted post for a cursor boundary: the query still executes (cursor is a logical `(created_at, id)` coordinate), and the deleted post is simply absent from results.
+- Identical `created_at` timestamps: pagination remains deterministic because the composite predicate always includes the `id` tie-breaker.
+- Backdated inserts: if a new post is inserted “between” already-rendered pages, cursor boundaries ensure it is not silently skipped at the page boundary.
+- Invalid cursors / invalid query shape: `400` with an error message (cursor is treated as opaque; clients must not parse it).
+
 ### `GET /v1/feed` (migration adapter)
 
 Query params:
@@ -108,6 +173,30 @@ Behavior:
 Note on page indexing:
 
 - This adapter assumes `page=0` means the first page (OFFSET=0). If your existing mobile app is 1-based, change the adapter mapping accordingly.
+
+## Migration Plan (v1 `?page=N` -> v2 cursors)
+
+Goal: keep old clients working during rollout, without reintroducing the deep-OFFSET performance bug.
+
+Phase 1 (now): ship the new cursor API
+- Deploy `GET /v2/feed` (cursor-based pagination).
+- Keep `GET /v1/feed` untouched.
+
+Phase 2 (week 2-4): add an adapter under `/v1/feed`
+- Update `GET /v1/feed?page=N` to internally route small pages through the cursor engine:
+  - `page < 50`: translate `page` into a cursor anchor and execute the keyset query.
+  - `page >= 50`: return `400` with an upgrade message (deep OFFSET is the bug we're fixing).
+
+Phase 3 (month 2): migrate new clients to `/v2/feed`
+- Web/mobile v2 uses `after`/`before` with `start_cursor`/`end_cursor`.
+- Monitor adoption and scrolling behavior.
+
+Phase 4 (month 3+): sunset `/v1/feed`
+- After old traffic drops below a threshold (example: `<5%`), return `410 Gone` with an upgrade message.
+
+Why the `page >= 50` guard?
+- Perfect backward compatibility for very deep pages would require using deep OFFSET to “recreate” a cursor boundary.
+- The assignment explicitly prioritizes fixing the performance/mechanics issue, so deep `OFFSET` is intentionally blocked.
 
 ## PostgreSQL schema
 
@@ -182,12 +271,8 @@ Main files:
    - `npm run dev`
 6. Test by either using browser or Postman:
    - First Request: http://localhost:3000/v2/feed?user_id=1&limit=10
-   - Second Request (after getting the cursor from server): http://localhost:3000/v2/feed?user_id=1&limit=10&cursor=eyJ0cyI6IjIwMjYtMDMtMjVUMDk6MjQ6MzYuMDk1WiIsImlkIjoiMTkxIn0
-
-Example:
-
-- First page: `GET /v2/feed?user_id=1&limit=10`
-- Next page (older): use `end_cursor` from the response as `after`
+   - Second Request (scroll older): http://localhost:3000/v2/feed?user_id=1&limit=10&after=`end_cursor`
+   - Second Request (scroll newer): http://localhost:3000/v2/feed?user_id=1&limit=10&before=`start_cursor`
 
 ## Tests
 
@@ -200,5 +285,8 @@ Integration tests are included (Jest) and exercise:
 - backdated inserts appear on the next page boundary (no skip)
 
 Run:
-
+1. For Mac/Linux:
 - `TEST_DATABASE_URL=postgresql://app:app@localhost:5432/cursorpage npm test`
+
+2. For window:
+- `$env:TEST_DATABASE_URL="postgresql://app:app@localhost:5432/cursorpage"; npm test`

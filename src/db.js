@@ -27,6 +27,20 @@ async function existsNewerThan(client, { userId, ts, id }) {
   return res.rowCount > 0;
 }
 
+async function existsOlderThan(client, { userId, ts, id }) {
+  const res = await client.query(
+    `
+    SELECT 1
+    FROM posts
+    WHERE user_id = $1
+      AND (created_at, id) < ($2::timestamptz, $3::bigint)
+    LIMIT 1
+    `,
+    [userId, ts, id]
+  );
+  return res.rowCount > 0;
+}
+
 async function getFeedV2(client, { userId, afterCursor, beforeCursor, limit }) {
   const decodedAfter = afterCursor ? decodeCursor(afterCursor) : null;
   const decodedBefore = beforeCursor ? decodeCursor(beforeCursor) : null;
@@ -34,8 +48,6 @@ async function getFeedV2(client, { userId, afterCursor, beforeCursor, limit }) {
   const limitPlusOne = limit + 1;
 
   let rows = [];
-  let hasNextPage = false;
-  let hasPreviousPage = false;
 
   if (!decodedAfter && !decodedBefore) {
     // First load: newest-first page.
@@ -50,9 +62,7 @@ async function getFeedV2(client, { userId, afterCursor, beforeCursor, limit }) {
       [userId, limitPlusOne]
     );
     rows = res.rows;
-    hasNextPage = rows.length > limit;
     rows = rows.slice(0, limit);
-    hasPreviousPage = false;
   } else if (decodedAfter) {
     // Scroll DOWN (older posts).
     const res = await client.query(
@@ -67,17 +77,7 @@ async function getFeedV2(client, { userId, afterCursor, beforeCursor, limit }) {
       [userId, decodedAfter.ts, BigInt(decodedAfter.id), limitPlusOne]
     );
     rows = res.rows;
-    hasNextPage = rows.length > limit;
     rows = rows.slice(0, limit);
-
-    const start = rows[0];
-    if (start) {
-      hasPreviousPage = await existsNewerThan(client, {
-        userId,
-        ts: start.created_at,
-        id: BigInt(start.id),
-      });
-    }
   } else {
     // Scroll UP (newer posts).
     const res = await client.query(
@@ -92,17 +92,7 @@ async function getFeedV2(client, { userId, afterCursor, beforeCursor, limit }) {
       [userId, decodedBefore.ts, BigInt(decodedBefore.id), limitPlusOne]
     );
     const ascRows = res.rows;
-    hasNextPage = ascRows.length > limit;
     rows = ascRows.slice(0, limit).reverse(); // newest-first for response
-
-    const start = rows[0];
-    if (start) {
-      hasPreviousPage = await existsNewerThan(client, {
-        userId,
-        ts: start.created_at,
-        id: BigInt(start.id),
-      });
-    }
   }
 
   if (rows.length === 0) {
@@ -123,9 +113,16 @@ async function getFeedV2(client, { userId, afterCursor, beforeCursor, limit }) {
     id: rows[rows.length - 1].id,
   });
 
-  // If we were paginating "up" (before=...), has_next_page is derived from the LIMIT+1 row.
-  // For "down" (after=...) the same approach works for has_next_page.
-  // has_previous_page is derived by checking existence of newer posts than the start row.
+  // Consistent semantics across both modes:
+  // - `has_next_page`: exists older than the end_cursor coordinate (scroll down)
+  // - `has_previous_page`: exists newer than the start_cursor coordinate (scroll up)
+  const start = rows[0];
+  const end = rows[rows.length - 1];
+  const [olderExists, newerExists] = await Promise.all([
+    existsOlderThan(client, { userId, ts: end.created_at, id: BigInt(end.id) }),
+    existsNewerThan(client, { userId, ts: start.created_at, id: BigInt(start.id) }),
+  ]);
+
   return {
     posts: rows.map((r) => ({
       id: r.id,
@@ -134,8 +131,8 @@ async function getFeedV2(client, { userId, afterCursor, beforeCursor, limit }) {
       body: r.body,
     })),
     page_info: {
-      has_next_page: Boolean(hasNextPage),
-      has_previous_page: Boolean(hasPreviousPage),
+      has_next_page: olderExists,
+      has_previous_page: newerExists,
       start_cursor: startCursor,
       end_cursor: endCursor,
     },
