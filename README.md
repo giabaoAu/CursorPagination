@@ -53,55 +53,56 @@ To support “before” efficiently, we query `ORDER BY created_at ASC, id ASC` 
 
 ```mermaid
 flowchart LR
-  C[Client] -->|GET /v2/feed| API[Express route]
-  API --> VAL[Validate query params (zod)]
-  VAL -->|after/before present?| BR{Cursor mode?}
-  BR -->|after| DECA[Decode cursor (base64url JSON)]
-  BR -->|before| DECB[Decode cursor (base64url JSON)]
-  BR -->|none| Q0[First load query: newest-first]
-  DECA --> QD[Query older posts\nWHERE (created_at,id) < (ts,id)\nORDER BY created_at DESC, id DESC\nLIMIT (limit+1)]
-  DECB --> QN[Query newer posts\nWHERE (created_at,id) > (ts,id)\nORDER BY created_at ASC, id ASC\nLIMIT (limit+1)\n(reverse rows for response)]
-  Q0 --> ENC[Encode start/end cursors]
+  C["Client"] -->|"GET /v2/feed"| API["Express route"]
+  API --> VAL["Validate query params (zod)"]
+  VAL -->|"after/before present?"| BR{"Cursor mode?"}
+  BR -->|"after"| DECA["Decode cursor (base64url JSON)"]
+  BR -->|"before"| DECB["Decode cursor (base64url JSON)"]
+  BR -->|"none"| Q0["First load query: newest-first"]
+  DECA --> QD["Query older posts\nWHERE (created_at,id) < (ts,id)\nORDER BY created_at DESC, id DESC\nLIMIT (limit+1)"]
+  DECB --> QN["Query newer posts\nWHERE (created_at,id) > (ts,id)\nORDER BY created_at ASC, id ASC\nLIMIT (limit+1)\n(reverse rows for response)"]
+  Q0 --> ENC["Encode start/end cursors"]
   QD --> ENC
   QN --> ENC
-  ENC --> RESP[Return posts + page_info\nhas_next_page / has_previous_page]
+  ENC --> RESP["Return posts + page_info\nhas_next_page / has_previous_page"]
 ```
 
 ### Pagination decision logic
 
 ```mermaid
 flowchart TD
-  A[Request to /v2/feed] --> B{after provided?}
-  B -->|yes| C[Scroll DOWN: older posts]
-  B -->|no| D{before provided?}
-  D -->|yes| E[Scroll UP: newer posts]
-  D -->|no| F[First load: newest posts]
+  A["Request to /v2/feed"] --> B{"after provided?"}
+  B -->|"yes"| C["Scroll DOWN: older posts"]
+  B -->|"no"| D{"before provided?"}
+  D -->|"yes"| E["Scroll UP: newer posts"]
+  D -->|"no"| F["First load: newest posts"]
 
-  C --> G[Predicate: (created_at,id) < (cursor_ts,cursor_id)]
-  E --> H[Predicate: (created_at,id) > (cursor_ts,cursor_id)]
-  F --> I[No predicate]
+  C --> G["Predicate: (created_at,id) < (cursor_ts,cursor_id)"]
+  E --> H["Predicate: (created_at,id) > (cursor_ts,cursor_id)"]
+  F --> I["No predicate"]
 
-  G --> J[ORDER BY created_at DESC, id DESC]
-  H --> K[ORDER BY created_at ASC, id ASC then reverse result]
-  I --> L[ORDER BY created_at DESC, id DESC]
+  G --> J["ORDER BY created_at DESC, id DESC"]
+  H --> K["ORDER BY created_at ASC, id ASC then reverse result"]
+  I --> L["ORDER BY created_at DESC, id DESC"]
 ```
 
 ### Cursor tuple semantics (backdated insert + deletion)
 
 ```mermaid
 flowchart LR
-  subgraph LogicalOrder[Logical feed order (newest -> oldest)]
-    X1[(created_at,id)=P0] --> X2[(created_at,id)=P1] --> X3[(created_at,id)=P2]
+  subgraph LogicalOrder["Logical feed order (newest -> oldest)"]
+    X1["(created_at,id)=P0"] --> X2["(created_at,id)=P1"] --> X3["(created_at,id)=P2"]
   end
 
-  CUR[Cursor points to (ts,id) = P1] --> OLDP[after => fetch "older": tuples < P1]
-  CUR --> NEWP[before => fetch "newer": tuples > P1]
+  CUR["Cursor points to (ts,id) = P1"] --> OLDP["after => fetch older: tuples < P1"]
+  CUR --> NEWP["before => fetch newer: tuples > P1"]
 
-  del[If P1 is deleted]:::warn --> still[Boundary remains valid:\nquery still runs,\nP1 just isn't returned]
-  backdated[If a backdated post inserts\nbetween already-fetched pages]:::info --> next[Next page includes it\n(no skip at boundary)]
+  del["If P1 is deleted"]:::warn --> still["Boundary remains valid:\nquery still runs,\nP1 just isn't returned"]
+  backdated["If a backdated post inserts\nbetween already-fetched pages"]:::info --> next["Next page includes it\n(no skip at boundary)"]
 
   classDef warn fill:#fff0f0,stroke:#cc0000;
   classDef info fill:#f0f7ff,stroke:#0066cc;
+
   CUR -.-> del
   CUR -.-> backdated
 ```
@@ -178,21 +179,14 @@ Note on page indexing:
 
 Goal: keep old clients working during rollout, without reintroducing the deep-OFFSET performance bug.
 
-Phase 1 (now): ship the new cursor API
-- Deploy `GET /v2/feed` (cursor-based pagination).
-- Keep `GET /v1/feed` untouched.
+## Migration Plan (v1 `?page=N` → v2 cursors)
 
-Phase 2 (week 2-4): add an adapter under `/v1/feed`
-- Update `GET /v1/feed?page=N` to internally route small pages through the cursor engine:
-  - `page < 50`: translate `page` into a cursor anchor and execute the keyset query.
-  - `page >= 50`: return `400` with an upgrade message (deep OFFSET is the bug we're fixing).
-
-Phase 3 (month 2): migrate new clients to `/v2/feed`
-- Web/mobile v2 uses `after`/`before` with `start_cursor`/`end_cursor`.
-- Monitor adoption and scrolling behavior.
-
-Phase 4 (month 3+): sunset `/v1/feed`
-- After old traffic drops below a threshold (example: `<5%`), return `410 Gone` with an upgrade message.
+| Phase | Timeline | What happens | Behavior | Notes |
+|------|---------|-------------|----------|------|
+| **Phase 1** | Now | Ship new cursor API | `GET /v2/feed` (cursor-based) is live. `GET /v1/feed` unchanged. | Safe rollout, no breaking changes |
+| **Phase 2** | Week 2–4 | Add adapter to v1 | Small pages (`page < 50`) translated to cursor queries | `page ≥ 50` returns `400` with upgrade message |
+| **Phase 3** | Month 2 | Migrate clients | Web/mobile use `after` / `before` with cursors | Monitor adoption + scrolling patterns |
+| **Phase 4** | Month 3+ | Sunset v1 | `GET /v1/feed` returns `410 Gone` when usage is low | Example threshold: <5% traffic |
 
 Why the `page >= 50` guard?
 - Perfect backward compatibility for very deep pages would require using deep OFFSET to “recreate” a cursor boundary.
